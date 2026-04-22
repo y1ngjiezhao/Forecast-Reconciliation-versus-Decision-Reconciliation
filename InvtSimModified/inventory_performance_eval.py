@@ -299,7 +299,7 @@ def collect_base_vs_ir_results(
     results.append(
         summarize_scenario_set(
             full_df=mint_file,
-            names=["lgb_base", "lgb_mint", "ets_base", "ets_mint"],
+            names= common_names, #["lgb_base", "lgb_mint", "ets_base", "ets_mint"],
             name_map=common_name_map,
             scenario_name="WLS_VAR_OR",
             level_ranges=level_ranges,

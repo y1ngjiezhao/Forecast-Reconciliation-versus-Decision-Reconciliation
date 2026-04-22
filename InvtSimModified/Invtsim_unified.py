@@ -1,4 +1,3 @@
-
 import warnings
 from typing import Sequence, Tuple, Optional
 
@@ -18,22 +17,28 @@ class InvtSim:
     - therefore, when L=1, arrival_t = order_{t-1}
 
     Forecast-based initialization (strictly causal):
-    - initial inventory position is the lead-time demand forecast:
-          IP_0 = sum_{j=0}^{L-1} forecast_j
-    - safety stock affects orders, not the fixed-order replay dynamics.
+    - initial inventory position is the lead-time demand forecast only
+    - safety stock enters the order-up-to target, but NOT the initial
+      inventory state used for replay
+    - therefore, service-level differences can affect generated orders
+      instead of being canceled by identical initial safety-stock offsets
 
     Notes
     -----
     1. ob_all_t():
        - computes safety stock from residuals
        - computes orders from forecasts via the order-up-to rule
+       - IMPORTANT: because an order placed at t arrives at t+L, the target
+         inventory position at time t must cover future demand starting at
+         t+1, i.e. forecast[t+1 : t+1+L]
        - replays those orders through the stock-flow system
 
     2. ob_all_t_fixedcase():
        - takes fixed orders as given
        - does NOT recompute orders from safety stock
-       - still uses the forecast sequence for causal initialization
-       - can preserve sst_* columns for reporting if supplied
+       - uses the forecast sequence for causal initialization
+       - preserves sst_* columns for reporting, but replay starts from the
+         same forecast-only initial inventory position as ob_all_t()
     """
 
     def __init__(
@@ -150,16 +155,21 @@ class InvtSim:
         order_source_99: Sequence[float],
         ss_values: Tuple[float, float, float],
         forecast_output: np.ndarray,
+        initial_ss_values: Optional[Tuple[float, float, float]] = None,
     ) -> pd.DataFrame:
         self._reset_logs()
         self.ss90, self.ss95, self.ss99 = ss_values
 
-        init_ip = self._initial_inventory_position(forecast_output)
-        self.ip_90t = init_ip
-        self.ip_95t = init_ip
-        self.ip_99t = init_ip
+        if initial_ss_values is None:
+            initial_ss_values = (0.0, 0.0, 0.0)
+        init_ss90, init_ss95, init_ss99 = initial_ss_values
 
-        self.net_90t, self.net_95t, self.net_99t = init_ip, init_ip, init_ip
+        init_ip = self._initial_inventory_position(forecast_output)
+        self.ip_90t = init_ip + init_ss90
+        self.ip_95t = init_ip + init_ss95
+        self.ip_99t = init_ip + init_ss99
+
+        self.net_90t, self.net_95t, self.net_99t = self.ip_90t, self.ip_95t, self.ip_99t
         self.wip_90t, self.wip_95t, self.wip_99t = 0.0, 0.0, 0.0
         self.bkl_90t, self.bkl_95t, self.bkl_99t = 0.0, 0.0, 0.0
 
@@ -232,23 +242,48 @@ class InvtSim:
         self.ss90, self.ss95, self.ss99 = self.ob_ss_t()
 
         orders_90, orders_95, orders_99 = [], [], []
-        ip90 = self._initial_inventory_position(forecast_output)
-        ip95 = ip90
-        ip99 = ip90
+        base_ip = self._initial_inventory_position(forecast_output)
+
+        # Mirror the same state timing used in _simulate_from_orders:
+        # start from forecast-only initial inventory, then for each period
+        # process arrival and demand first, and finally place a new order for
+        # future demand. Safety stock affects the target, not the initial state.
+        net90 = base_ip
+        net95 = base_ip
+        net99 = base_ip
+        wip90 = wip95 = wip99 = 0.0
 
         for t in range(self.period):
-            dtl = self._lead_time_demand(forecast_output, t)
-            o90 = max(0.0, dtl + self.ss90 - ip90)
-            o95 = max(0.0, dtl + self.ss95 - ip95)
-            o99 = max(0.0, dtl + self.ss99 - ip99)
+            arr90 = self._arrival_from_orders(orders_90, t, self.L)
+            arr95 = self._arrival_from_orders(orders_95, t, self.L)
+            arr99 = self._arrival_from_orders(orders_99, t, self.L)
+
+            net90 = net90 + arr90 - self.truth[t]
+            net95 = net95 + arr95 - self.truth[t]
+            net99 = net99 + arr99 - self.truth[t]
+
+            wip90 = wip90 - arr90
+            wip95 = wip95 - arr95
+            wip99 = wip99 - arr99
+
+            ip90_preorder = net90 + wip90
+            ip95_preorder = net95 + wip95
+            ip99_preorder = net99 + wip99
+
+            # Order placed at t arrives at t+L, so the target must cover
+            # future demand starting at t+1, not the current period t.
+            dtl = self._lead_time_demand(forecast_output, t + 1)
+            o90 = max(0.0, dtl + self.ss90 - ip90_preorder)
+            o95 = max(0.0, dtl + self.ss95 - ip95_preorder)
+            o99 = max(0.0, dtl + self.ss99 - ip99_preorder)
 
             orders_90.append(o90)
             orders_95.append(o95)
             orders_99.append(o99)
 
-            ip90 = ip90 + o90 - self.truth[t]
-            ip95 = ip95 + o95 - self.truth[t]
-            ip99 = ip99 + o99 - self.truth[t]
+            wip90 = wip90 + o90
+            wip95 = wip95 + o95
+            wip99 = wip99 + o99
 
         return self._simulate_from_orders(
             order_source_90=orders_90,
@@ -256,6 +291,7 @@ class InvtSim:
             order_source_99=orders_99,
             ss_values=(self.ss90, self.ss95, self.ss99),
             forecast_output=forecast_output,
+            initial_ss_values=(0.0, 0.0, 0.0),
         )
 
     def ob_all_t_fixedcase(self, fixed_order: pd.DataFrame):
@@ -269,7 +305,9 @@ class InvtSim:
         else:
             forecast_output = self._safe_forecast_output(self.fcst, self.period)
 
-        # Preserve sst labels if present; otherwise keep zeros.
+        # Preserve sst labels for reporting if present. Replay still starts
+        # from the forecast-only initial inventory position, with no initial
+        # safety-stock offset.
         if {"sst_90", "sst_95", "sst_99"}.issubset(fixed_order.columns):
             ss_values = (
                 float(fixed_order["sst_90"].iloc[0]),
@@ -296,4 +334,5 @@ class InvtSim:
             order_source_99=c,
             ss_values=ss_values,
             forecast_output=forecast_output,
+            initial_ss_values=(0.0, 0.0, 0.0),
         )
